@@ -1,0 +1,195 @@
+# ============================================================
+# Adaptive Quant Golden Window Engine v7 (Compressed)
+# ============================================================
+
+class AQGWE:
+
+    CONFIG(
+        percentile=65,
+        decay=0.97,
+        min_trades=50,
+        top_hour=4,
+        top_10m=24,
+        regime=["UP","DOWN","SIDE","HIGH_VOL","LOW_VOL"],
+        score_clip=(0,100),
+    )
+
+    # --------------------------------------------------------
+    # PREPROCESS
+    # --------------------------------------------------------
+
+    rates      = WeightedMean(TimeDecay(logs))
+    threshold  = Percentile(rates, percentile)
+    binary     = rates >= threshold
+
+    # --------------------------------------------------------
+    # WINDOW
+    # --------------------------------------------------------
+
+    windows = Regex("1+").Extract(binary)
+
+    # --------------------------------------------------------
+    # FEATURE
+    # --------------------------------------------------------
+
+    FOR window IN windows:
+
+        length        = Count(window)
+        trades        = TradeCount(window)
+
+        mean          = WeightedMean(window)
+        std           = WeightedStd(window)
+
+        stability     = 1/(1+std)
+
+        length_bonus  = log2(length+1)
+
+        trade_bonus   = log2(trades+2)
+
+        confidence    = min(1,trades/min_trades)
+
+        winrate       = WinRate(window)
+
+        pf            = ProfitFactor(window)
+
+        consistency   = Clip(0.5+winrate,.8,1.5) \
+                      * Clip(log2(pf+1),.8,2.5)
+
+    # --------------------------------------------------------
+    # REGIME
+    # --------------------------------------------------------
+
+    regime = DetectRegime(price)
+
+    regime_weight = Memory.RegimeWeight(
+
+        symbol,
+        regime
+
+    )
+
+    # --------------------------------------------------------
+    # QUANT SCORE
+    # --------------------------------------------------------
+
+    quality = (
+
+        mean**1.5
+
+        *
+
+        consistency
+
+    )
+
+    statistical = (
+
+        stability
+
+        *
+
+        length_bonus
+
+    )
+
+    reliability = (
+
+        trade_bonus
+
+        *
+
+        confidence
+
+    )
+
+    score = Clip(
+
+        quality
+
+        *
+
+        statistical
+
+        *
+
+        reliability
+
+        *
+
+        regime_weight,
+
+        0,
+
+        100
+
+    )
+
+    # --------------------------------------------------------
+    # RANK
+    # --------------------------------------------------------
+
+    Rank(
+
+        score,
+
+        mean,
+
+        consistency,
+
+        trades,
+
+        length
+
+    )
+
+    # --------------------------------------------------------
+    # KEEP
+    # --------------------------------------------------------
+
+    HourWindow  = Top(4)
+
+    TenMinWindow = Top(24)
+
+    # --------------------------------------------------------
+    # MEMORY
+    # --------------------------------------------------------
+
+    Memory.Save(
+
+        symbol,
+
+        regime,
+
+        HourWindow,
+
+        TenMinWindow
+
+    )
+
+    # --------------------------------------------------------
+    # OUTPUT
+    # --------------------------------------------------------
+
+    Print()
+
+    Debug()
+
+    Save()
+
+# ============================================================
+#
+# API
+#
+# ============================================================
+
+engine.learn(symbol, logs, price)
+
+engine.predict(symbol, price)
+
+engine.top(symbol)
+
+engine.debug(symbol)
+
+engine.save()
+
+engine.load()
