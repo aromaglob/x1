@@ -1,0 +1,6 @@
+            rates = [npmean(data["log"][i]) if data["log"][i] else 0.5 for i in range(24)]
+            threshold = np.percentile(rates, 65)
+            best_hours = [i for i, r in enumerate(rates) if r >= threshold]
+            if best_hours:
+                data["window"] = [min(best_hours), max(best_hours)]
+                print(f"🧬 [EVOLVE] {sym}: Golden Window Calibrated to {data['window']}h")
