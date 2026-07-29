@@ -1,3 +1,25 @@
+def longest_contiguous_block(indices):
+    # indices: 정렬된 정수 리스트 (예: best_hours)
+    best_start = best_end = None
+    cur_start = cur_end = None
+    for i in indices:
+        if cur_start is None:
+            cur_start = cur_end = i
+        elif i == cur_end + 1:
+            cur_end = i
+        else:
+            if best_start is None or (cur_end - cur_start) > (best_end - best_start):
+                best_start, best_end = cur_start, cur_end
+            cur_start = cur_end = i
+    if cur_start is not None:
+        if best_start is None or (cur_end - cur_start) > (best_end - best_start):
+            best_start, best_end = cur_start, cur_end
+    return (best_start, best_end) if best_start is not None else None
+
+
+
+
+
             rates = [npmean(data["log"][i]) if data["log"][i] else 0.5 for i in range(24)]
             threshold = np.percentile(rates, 65)
             best_hours = [i for i, r in enumerate(rates) if r >= threshold]
