@@ -1,3 +1,197 @@
+import numpy as np
+
+
+# ==========================================
+# Universal Golden Window Finder
+# ==========================================
+
+def find_golden_windows(
+    logs,
+    percentile=65,
+    max_windows=4,
+    default_rate=0.5,
+    slot_minutes=60
+):
+    """
+    Parameters
+    ----------
+    logs : list
+        예)
+            1시간 : 길이 24
+            10분 : 길이 144
+
+        각 원소는 거래 결과 리스트
+
+    percentile : int
+        Golden Window 기준
+
+    max_windows : int
+        유지할 Window 개수
+
+    default_rate : float
+        데이터 없을 때 기본값
+
+    slot_minutes : int
+        60 = 시간단위
+        10 = 10분단위
+
+    Returns
+    -------
+    {
+        "rates": [...],
+        "threshold": ...,
+        "windows": [
+            {
+                "start":0,
+                "end":3,
+                "score":0.74,
+                "length":4,
+                "start_time":"00:00",
+                "end_time":"03:00"
+            },
+            ...
+        ]
+    }
+    """
+
+    slot_count = len(logs)
+
+    rates = [
+        np.mean(x) if len(x) else default_rate
+        for x in logs
+    ]
+
+    threshold = np.percentile(rates, percentile)
+
+    good = [r >= threshold for r in rates]
+
+    windows = []
+
+    start = None
+
+    for i in range(slot_count):
+
+        if good[i]:
+
+            if start is None:
+                start = i
+
+        else:
+
+            if start is not None:
+
+                end = i - 1
+
+                score = np.mean(rates[start:end+1])
+
+                windows.append({
+                    "start": start,
+                    "end": end,
+                    "score": float(score),
+                    "length": end-start+1
+                })
+
+                start = None
+
+    if start is not None:
+
+        end = slot_count - 1
+
+        score = np.mean(rates[start:end+1])
+
+        windows.append({
+            "start": start,
+            "end": end,
+            "score": float(score),
+            "length": end-start+1
+        })
+
+    # 점수 → 길이 순
+    windows.sort(
+        key=lambda w: (w["score"], w["length"]),
+        reverse=True
+    )
+
+    windows = windows[:max_windows]
+
+    # 시간 문자열 추가
+    def slot_to_time(slot):
+
+        total = slot * slot_minutes
+
+        h = total // 60
+        m = total % 60
+
+        return f"{h:02d}:{m:02d}"
+
+    for w in windows:
+
+        w["start_time"] = slot_to_time(w["start"])
+        w["end_time"] = slot_to_time(w["end"])
+
+    return {
+        "rates": rates,
+        "threshold": threshold,
+        "windows": windows
+    }
+
+
+# ==========================================
+# Example : 1 Hour
+# ==========================================
+
+hour_result = find_golden_windows(
+    logs=data["log"],
+    percentile=65,
+    max_windows=4,
+    slot_minutes=60
+)
+
+data["windows"] = hour_result["windows"]
+
+print(f"\n🧬 [{sym}] Hour Golden Windows")
+
+for w in data["windows"]:
+
+    print(
+        f"{w['start']:02d}~{w['end']:02d} "
+        f"({w['start_time']} ~ {w['end_time']}) "
+        f"score={w['score']:.3f}"
+    )
+
+
+# ==========================================
+# Example : 10 Minutes
+# ==========================================
+
+ten_result = find_golden_windows(
+    logs=data["log10"],
+    percentile=65,
+    max_windows=24,
+    slot_minutes=10
+)
+
+data["windows10"] = ten_result["windows"]
+
+print(f"\n🧬 [{sym}] 10-Min Golden Windows")
+
+for w in data["windows10"]:
+
+    print(
+        f"{w['start']:03d}~{w['end']:03d} "
+        f"({w['start_time']} ~ {w['end_time']}) "
+        f"score={w['score']:.3f}"
+    )
+
+
+
+
+
+
+
+
+
+
 def longest_contiguous_block(indices):
     # indices: 정렬된 정수 리스트 (예: best_hours)
     best_start = best_end = None
