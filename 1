@@ -1,0 +1,1493 @@
+"""
+============================================================
+ Adaptive Quant Golden Window Engine v7
+ Part 1-1
+------------------------------------------------------------
+Config
+Data Models
+Time Decay
+Statistics
+Utility Functions
+============================================================
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+EPS = 1e-9
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+@dataclass
+class AQConfig:
+
+    percentile: float = 65.0
+
+    default_rate: float = 0.5
+
+    decay_alpha: float = 0.97
+
+    min_trades: int = 50
+
+    max_windows: int = 4
+
+    debug: bool = True
+
+
+# ============================================================
+# WINDOW
+# ============================================================
+
+@dataclass
+class Window:
+
+    start: int
+
+    end: int
+
+    score: float = 0.0
+
+    weighted_mean: float = 0.0
+
+    weighted_std: float = 0.0
+
+    stability: float = 0.0
+
+    length_bonus: float = 0.0
+
+    trade_bonus: float = 0.0
+
+    confidence: float = 0.0
+
+    win_rate: float = 0.0
+
+    profit_factor: float = 0.0
+
+    consistency: float = 0.0
+
+    trade_count: int = 0
+
+    regime: str = "SIDE"
+
+    meta: dict = field(default_factory=dict)
+
+
+# ============================================================
+# SYMBOL MEMORY
+# ============================================================
+
+@dataclass
+class SymbolMemory:
+
+    hourly: Dict[str, List[Window]] = field(default_factory=dict)
+
+    minute10: Dict[str, List[Window]] = field(default_factory=dict)
+
+
+# ============================================================
+# TIME DECAY
+# ============================================================
+
+class TimeDecay:
+
+    @staticmethod
+    def weights(n: int, alpha: float):
+
+        if n <= 0:
+            return np.array([])
+
+        w = alpha ** np.arange(n - 1, -1, -1)
+
+        return w / w.sum()
+
+    @staticmethod
+    def mean(values, alpha):
+
+        values = np.asarray(values, dtype=float)
+
+        if len(values) == 0:
+            return 0.0
+
+        w = TimeDecay.weights(len(values), alpha)
+
+        return float(np.average(values, weights=w))
+
+    @staticmethod
+    def std(values, alpha):
+
+        values = np.asarray(values, dtype=float)
+
+        if len(values) == 0:
+            return 0.0
+
+        w = TimeDecay.weights(len(values), alpha)
+
+        m = np.average(values, weights=w)
+
+        var = np.average((values - m) ** 2, weights=w)
+
+        return float(np.sqrt(var))
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+class Statistics:
+
+    @staticmethod
+    def weighted_mean(values, alpha):
+
+        return TimeDecay.mean(values, alpha)
+
+    @staticmethod
+    def weighted_std(values, alpha):
+
+        return TimeDecay.std(values, alpha)
+
+    @staticmethod
+    def stability(std):
+
+        return 1.0 / (1.0 + std)
+
+    @staticmethod
+    def length_bonus(length):
+
+        return np.clip(
+
+            np.log2(length + 1),
+
+            1.0,
+
+            4.0
+
+        )
+
+    @staticmethod
+    def trade_bonus(trades):
+
+        return np.clip(
+
+            np.log2(trades + 2),
+
+            1.0,
+
+            6.0
+
+        )
+
+    @staticmethod
+    def confidence(trades, minimum):
+
+        return min(
+
+            1.0,
+
+            trades / max(1, minimum)
+
+        )
+
+    @staticmethod
+    def win_rate(values):
+
+        values = np.asarray(values)
+
+        if len(values) == 0:
+            return 0.0
+
+        return float(np.mean(values > 0))
+
+    @staticmethod
+    def winrate_bonus(winrate):
+
+        return np.clip(
+
+            0.5 + winrate,
+
+            0.8,
+
+            1.5
+
+        )
+
+    @staticmethod
+    def profit_factor(values):
+
+        values = np.asarray(values)
+
+        gp = values[values > 0].sum()
+
+        gl = abs(values[values < 0].sum())
+
+        return gp / (gl + EPS)
+
+    @staticmethod
+    def profit_factor_bonus(pf):
+
+        return np.clip(
+
+            np.log2(pf + 1),
+
+            0.8,
+
+            2.5
+
+        )
+
+
+# ============================================================
+# UTIL
+# ============================================================
+
+class Util:
+
+    @staticmethod
+    def slot_to_hour(slot):
+
+        return f"{slot:02d}:00"
+
+    @staticmethod
+    def slot_to_10m(slot):
+
+        h = slot // 6
+
+        m = (slot % 6) * 10
+
+        return f"{h:02d}:{m:02d}"
+
+    @staticmethod
+    def slot_label(slot, total_slots):
+
+        if total_slots == 24:
+
+            return Util.slot_to_hour(slot)
+
+        if total_slots == 144:
+
+            return Util.slot_to_10m(slot)
+
+        return str(slot)
+
+    @staticmethod
+    def flatten(logs):
+
+        out = []
+
+        for x in logs:
+
+            out.extend(x)
+
+        return out
+
+    @staticmethod
+    def debug(cfg: AQConfig, *args):
+
+        if cfg.debug:
+
+            print("[AQGW]", *args)
+
+
+# ============================================================
+# END OF PART 1-1
+# ============================================================
+# ============================================================
+# PART 1-2
+#
+# Percentile
+# Binary Mapping
+# Regex Window
+# Feature Extraction
+#
+# ============================================================
+
+import re
+
+
+# ============================================================
+# PREPROCESS
+# ============================================================
+
+class Preprocessor:
+
+    @staticmethod
+    def build_rates(logs, cfg):
+
+        rates = []
+
+        for slot_logs in logs:
+
+            if len(slot_logs):
+
+                rate = Statistics.weighted_mean(
+                    slot_logs,
+                    cfg.decay_alpha
+                )
+
+            else:
+
+                rate = cfg.default_rate
+
+            rates.append(rate)
+
+        return np.asarray(rates, dtype=float)
+
+    @staticmethod
+    def threshold(rates, cfg):
+
+        return np.percentile(
+            rates,
+            cfg.percentile
+        )
+
+    @staticmethod
+    def binary(rates, threshold):
+
+        return (rates >= threshold).astype(np.int8)
+
+
+# ============================================================
+# REGEX WINDOW
+# ============================================================
+
+class RegexWindow:
+
+    @staticmethod
+    def extract(binary):
+
+        text = "".join(map(str, binary))
+
+        windows = []
+
+        for m in re.finditer("1+", text):
+
+            windows.append(
+
+                (
+
+                    m.start(),
+
+                    m.end() - 1
+
+                )
+
+            )
+
+        return windows
+
+
+# ============================================================
+# FEATURE
+# ============================================================
+
+class FeatureExtractor:
+
+    @staticmethod
+    def build_window(
+
+        logs,
+
+        rates,
+
+        start,
+
+        end,
+
+        cfg
+
+    ):
+
+        values = []
+
+        trade_count = 0
+
+        for i in range(start, end + 1):
+
+            values.extend(logs[i])
+
+            trade_count += len(logs[i])
+
+        if len(values) == 0:
+
+            return None
+
+        values = np.asarray(values)
+
+        wmean = Statistics.weighted_mean(
+            values,
+            cfg.decay_alpha
+        )
+
+        wstd = Statistics.weighted_std(
+            values,
+            cfg.decay_alpha
+        )
+
+        stability = Statistics.stability(
+            wstd
+        )
+
+        length = end - start + 1
+
+        length_bonus = Statistics.length_bonus(
+            length
+        )
+
+        trade_bonus = Statistics.trade_bonus(
+            trade_count
+        )
+
+        confidence = Statistics.confidence(
+
+            trade_count,
+
+            cfg.min_trades
+
+        )
+
+        winrate = Statistics.win_rate(
+            values
+        )
+
+        win_bonus = Statistics.winrate_bonus(
+            winrate
+        )
+
+        pf = Statistics.profit_factor(
+            values
+        )
+
+        pf_bonus = Statistics.profit_factor_bonus(
+            pf
+        )
+
+        consistency = (
+            win_bonus
+            *
+            pf_bonus
+        )
+
+        return Window(
+
+            start=start,
+
+            end=end,
+
+            weighted_mean=wmean,
+
+            weighted_std=wstd,
+
+            stability=stability,
+
+            length_bonus=length_bonus,
+
+            trade_bonus=trade_bonus,
+
+            confidence=confidence,
+
+            win_rate=winrate,
+
+            profit_factor=pf,
+
+            consistency=consistency,
+
+            trade_count=trade_count
+
+        )
+
+
+# ============================================================
+# WINDOW BUILDER
+# ============================================================
+
+class WindowBuilder:
+
+    @staticmethod
+    def build(
+
+        logs,
+
+        cfg
+
+    ):
+
+        rates = Preprocessor.build_rates(
+
+            logs,
+
+            cfg
+
+        )
+
+        threshold = Preprocessor.threshold(
+
+            rates,
+
+            cfg
+
+        )
+
+        binary = Preprocessor.binary(
+
+            rates,
+
+            threshold
+
+        )
+
+        spans = RegexWindow.extract(
+
+            binary
+
+        )
+
+        windows = []
+
+        for start, end in spans:
+
+            w = FeatureExtractor.build_window(
+
+                logs,
+
+                rates,
+
+                start,
+
+                end,
+
+                cfg
+
+            )
+
+            if w is not None:
+
+                windows.append(w)
+
+        return (
+
+            rates,
+
+            threshold,
+
+            binary,
+
+            windows
+
+        )
+
+
+# ============================================================
+# LABEL
+# ============================================================
+
+class WindowFormatter:
+
+    @staticmethod
+    def label(window, total_slots):
+
+        s = Util.slot_label(
+
+            window.start,
+
+            total_slots
+
+        )
+
+        e = Util.slot_label(
+
+            window.end,
+
+            total_slots
+
+        )
+
+        return f"{s} ~ {e}"
+
+    @staticmethod
+    def print(
+
+        windows,
+
+        total_slots
+
+    ):
+
+        print()
+
+        print("Golden Windows")
+
+        print("=" * 60)
+
+        for w in windows:
+
+            print(
+
+                f"{WindowFormatter.label(w,total_slots):18s}"
+
+                f" Mean={w.weighted_mean:7.4f}"
+
+                f" PF={w.profit_factor:6.2f}"
+
+                f" WR={w.win_rate:6.2%}"
+
+                f" Trades={w.trade_count:4d}"
+
+            )
+
+
+# ============================================================
+# END PART 1-2
+# ============================================================
+# ============================================================
+#
+# PART 1-3
+#
+# Core Engine
+#
+# ============================================================
+
+class AdaptiveQuantEngine:
+
+    def __init__(self, config=None):
+
+        self.cfg = config or AQConfig()
+
+        self.memory = {}
+
+    # ---------------------------------------------------------
+
+    def _get_symbol(self, symbol):
+
+        if symbol not in self.memory:
+
+            self.memory[symbol] = SymbolMemory()
+
+        return self.memory[symbol]
+
+    # ---------------------------------------------------------
+
+    def learn(
+
+        self,
+
+        symbol,
+
+        logs,
+
+        timeframe="1H"
+
+    ):
+
+        rates, threshold, binary, windows = WindowBuilder.build(
+
+            logs,
+
+            self.cfg
+
+        )
+
+        mem = self._get_symbol(symbol)
+
+        if timeframe == "1H":
+
+            mem.hourly["DEFAULT"] = windows
+
+        else:
+
+            mem.minute10["DEFAULT"] = windows
+
+        Util.debug(
+
+            self.cfg,
+
+            f"{symbol} Learn Complete",
+
+            f"Windows={len(windows)}"
+
+        )
+
+        return windows
+
+    # ---------------------------------------------------------
+
+    def predict(
+
+        self,
+
+        symbol,
+
+        timeframe="1H"
+
+    ):
+
+        if symbol not in self.memory:
+
+            return []
+
+        mem = self.memory[symbol]
+
+        if timeframe == "1H":
+
+            return mem.hourly.get(
+
+                "DEFAULT",
+
+                []
+
+            )
+
+        return mem.minute10.get(
+
+            "DEFAULT",
+
+            []
+
+        )
+
+    # ---------------------------------------------------------
+
+    def top(
+
+        self,
+
+        symbol,
+
+        timeframe="1H",
+
+        n=None
+
+    ):
+
+        n = n or self.cfg.max_windows
+
+        windows = self.predict(
+
+            symbol,
+
+            timeframe
+
+        )
+
+        windows.sort(
+
+            key=lambda w:
+
+                (
+
+                    w.weighted_mean,
+
+                    w.consistency,
+
+                    w.trade_count,
+
+                    w.length_bonus
+
+                ),
+
+            reverse=True
+
+        )
+
+        return windows[:n]
+
+    # ---------------------------------------------------------
+
+    def debug(
+
+        self,
+
+        symbol,
+
+        timeframe="1H",
+
+        slots=24
+
+    ):
+
+        windows = self.predict(
+
+            symbol,
+
+            timeframe
+
+        )
+
+        WindowFormatter.print(
+
+            windows,
+
+            slots
+
+        )
+
+    # ---------------------------------------------------------
+
+    def clear(self):
+
+        self.memory.clear()
+
+    # ---------------------------------------------------------
+
+    def symbols(self):
+
+        return list(
+
+            self.memory.keys()
+
+        )
+# ============================================================
+#
+# PART 2-1
+#
+# Adaptive Quant Score
+#
+# ============================================================
+
+class QuantScore:
+
+    @staticmethod
+    def quality(window):
+
+        return (
+
+            max(window.weighted_mean, 0.0)
+
+            ** 1.5
+
+            *
+
+            window.consistency
+
+        )
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def statistical(window):
+
+        return (
+
+            window.stability
+
+            *
+
+            window.length_bonus
+
+        )
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def reliability(window):
+
+        return (
+
+            window.trade_bonus
+
+            *
+
+            window.confidence
+
+        )
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def score(window):
+
+        quality = QuantScore.quality(window)
+
+        statistical = QuantScore.statistical(window)
+
+        reliability = QuantScore.reliability(window)
+
+        score = (
+
+            quality
+
+            *
+
+            statistical
+
+            *
+
+            reliability
+
+        )
+
+        return float(np.clip(score, 0.0, 100.0))
+
+
+# ============================================================
+#
+# SCORE ENGINE
+#
+# ============================================================
+
+class ScoreEngine:
+
+    @staticmethod
+    def update(windows):
+
+        for w in windows:
+
+            w.score = QuantScore.score(w)
+
+        return windows
+
+
+# ============================================================
+#
+# RANKING
+#
+# ============================================================
+
+class Ranking:
+
+    @staticmethod
+    def sort(windows):
+
+        windows.sort(
+
+            key=lambda w: (
+
+                w.score,
+
+                w.weighted_mean,
+
+                w.consistency,
+
+                w.trade_count,
+
+                w.length_bonus,
+
+                -w.weighted_std
+
+            ),
+
+            reverse=True
+
+        )
+
+        return windows
+
+
+# ============================================================
+#
+# ENGINE PATCH
+#
+# ============================================================
+
+def _engine_score(self, windows):
+
+    windows = ScoreEngine.update(windows)
+
+    windows = Ranking.sort(windows)
+
+    return windows
+
+
+AdaptiveQuantEngine.score = _engine_score
+
+
+# ============================================================
+#
+# PATCH LEARN
+#
+# ============================================================
+
+_old_learn = AdaptiveQuantEngine.learn
+
+
+def _learn(
+
+    self,
+
+    symbol,
+
+    logs,
+
+    timeframe="1H"
+
+):
+
+    windows = _old_learn(
+
+        self,
+
+        symbol,
+
+        logs,
+
+        timeframe
+
+    )
+
+    windows = self.score(windows)
+
+    mem = self._get_symbol(symbol)
+
+    if timeframe == "1H":
+
+        mem.hourly["DEFAULT"] = windows
+
+    else:
+
+        mem.minute10["DEFAULT"] = windows
+
+    return windows
+
+
+AdaptiveQuantEngine.learn = _learn
+
+
+# ============================================================
+#
+# PATCH TOP
+#
+# ============================================================
+
+_old_top = AdaptiveQuantEngine.top
+
+
+def _top(
+
+    self,
+
+    symbol,
+
+    timeframe="1H",
+
+    n=None
+
+):
+
+    windows = _old_top(
+
+        self,
+
+        symbol,
+
+        timeframe,
+
+        n
+
+    )
+
+    windows = Ranking.sort(windows)
+
+    return windows[: n or self.cfg.max_windows]
+
+
+AdaptiveQuantEngine.top = _top
+
+
+# ============================================================
+#
+# DEBUG SCORE
+#
+# ============================================================
+
+def print_scores(
+
+    windows,
+
+    slots
+
+):
+
+    print()
+
+    print("=" * 90)
+
+    print("Adaptive Quant Score")
+
+    print("=" * 90)
+
+    for w in windows:
+
+        print(
+
+            f"{WindowFormatter.label(w,slots):18s}"
+
+            f" Score={w.score:7.3f}"
+
+            f" Mean={w.weighted_mean:7.4f}"
+
+            f" WR={w.win_rate:6.2%}"
+
+            f" PF={w.profit_factor:6.2f}"
+
+            f" Trades={w.trade_count:5d}"
+
+        )
+
+
+AdaptiveQuantEngine.print_scores = staticmethod(
+
+    print_scores
+
+)
+
+
+# ============================================================
+#
+# END PART 2-1
+#
+# ============================================================
+# ============================================================
+#
+# PART 2-2
+#
+# Market Regime
+# Regime Memory
+# Adaptive Ranking
+#
+# ============================================================
+
+from enum import Enum
+
+
+# ============================================================
+# REGIME
+# ============================================================
+
+class MarketRegime(str, Enum):
+
+    UP = "UP"
+
+    DOWN = "DOWN"
+
+    SIDE = "SIDE"
+
+    HIGH_VOL = "HIGH_VOL"
+
+    LOW_VOL = "LOW_VOL"
+
+
+# ============================================================
+# REGIME DETECTOR
+# ============================================================
+
+class RegimeDetector:
+
+    @staticmethod
+    def detect(
+        prices,
+        trend_threshold=0.03,
+        vol_threshold=0.02
+    ):
+
+        prices = np.asarray(prices, dtype=float)
+
+        if len(prices) < 5:
+            return MarketRegime.SIDE
+
+        ret = np.diff(prices) / (prices[:-1] + EPS)
+
+        trend = (prices[-1] - prices[0]) / (prices[0] + EPS)
+
+        vol = np.std(ret)
+
+        if vol >= vol_threshold:
+            return MarketRegime.HIGH_VOL
+
+        if trend >= trend_threshold:
+            return MarketRegime.UP
+
+        if trend <= -trend_threshold:
+            return MarketRegime.DOWN
+
+        return MarketRegime.SIDE
+
+
+# ============================================================
+# REGIME MEMORY
+# ============================================================
+
+class RegimeMemory:
+
+    def __init__(self):
+
+        self.data = {}
+
+    def put(
+
+        self,
+
+        symbol,
+
+        regime,
+
+        windows
+
+    ):
+
+        self.data.setdefault(symbol, {})
+
+        self.data[symbol][regime] = windows
+
+    def get(
+
+        self,
+
+        symbol,
+
+        regime
+
+    ):
+
+        return self.data.get(
+
+            symbol,
+
+            {}
+
+        ).get(
+
+            regime,
+
+            []
+
+        )
+
+    def regimes(self, symbol):
+
+        return list(
+
+            self.data.get(
+
+                symbol,
+
+                {}
+
+            ).keys()
+
+        )
+
+
+# ============================================================
+# REGIME WEIGHT
+# ============================================================
+
+class RegimeWeight:
+
+    DEFAULT = {
+
+        MarketRegime.UP: 1.05,
+
+        MarketRegime.DOWN: 0.95,
+
+        MarketRegime.SIDE: 1.00,
+
+        MarketRegime.HIGH_VOL: 0.95,
+
+        MarketRegime.LOW_VOL: 1.02,
+
+    }
+
+    @classmethod
+    def weight(
+
+        cls,
+
+        regime
+
+    ):
+
+        return cls.DEFAULT.get(
+
+            regime,
+
+            1.0
+
+        )
+
+
+# ============================================================
+# SCORE PATCH
+# ============================================================
+
+_old_score = QuantScore.score
+
+
+def _score(window):
+
+    base = _old_score(window)
+
+    regime_weight = RegimeWeight.weight(
+
+        MarketRegime(window.regime)
+
+        if isinstance(window.regime, str)
+
+        else window.regime
+
+    )
+
+    return float(
+
+        np.clip(
+
+            base * regime_weight,
+
+            0,
+
+            100
+
+        )
+
+    )
+
+
+QuantScore.score = staticmethod(_score)
+
+
+# ============================================================
+# ENGINE PATCH
+# ============================================================
+
+AdaptiveQuantEngine.regime_memory = RegimeMemory()
+
+
+def learn_regime(
+
+    self,
+
+    symbol,
+
+    logs,
+
+    prices,
+
+    timeframe="1H"
+
+):
+
+    regime = RegimeDetector.detect(
+
+        prices
+
+    )
+
+    windows = self.learn(
+
+        symbol,
+
+        logs,
+
+        timeframe
+
+    )
+
+    for w in windows:
+
+        w.regime = regime
+
+        w.score = QuantScore.score(w)
+
+    self.regime_memory.put(
+
+        symbol,
+
+        regime,
+
+        windows
+
+    )
+
+    Util.debug(
+
+        self.cfg,
+
+        f"{symbol}",
+
+        f"Regime={regime}",
+
+        f"Windows={len(windows)}"
+
+    )
+
+    return windows
+
+
+AdaptiveQuantEngine.learn_regime = learn_regime
+
+
+# ============================================================
+# PREDICT REGIME
+# ============================================================
+
+def predict_regime(
+
+    self,
+
+    symbol,
+
+    prices
+
+):
+
+    regime = RegimeDetector.detect(
+
+        prices
+
+    )
+
+    windows = self.regime_memory.get(
+
+        symbol,
+
+        regime
+
+    )
+
+    windows = Ranking.sort(
+
+        windows
+
+    )
+
+    return windows
+
+
+AdaptiveQuantEngine.predict_regime = predict_regime
+
+
+# ============================================================
+# PRINT REGIME
+# ============================================================
+
+def print_regime(
+
+    self,
+
+    symbol
+
+):
+
+    print()
+
+    print("=" * 70)
+
+    print(symbol)
+
+    print("=" * 70)
+
+    for r in self.regime_memory.regimes(symbol):
+
+        print(r)
+
+
+AdaptiveQuantEngine.print_regime = print_regime
+
+
+# ============================================================
+# END PART 2-2
+# ============================================================
