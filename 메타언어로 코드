@@ -1,0 +1,297 @@
+import numpy as np
+import re
+
+
+class GoldenWindowFinder:
+
+    def __init__(
+        self,
+        percentile=65,
+        default_rate=0.5
+    ):
+        self.percentile = percentile
+        self.default_rate = default_rate
+
+    # -----------------------------------------------------
+    # Slot -> Time
+    # -----------------------------------------------------
+    @staticmethod
+    def slot_to_time(slot, slot_minutes):
+
+        total = slot * slot_minutes
+
+        h = total // 60
+        m = total % 60
+
+        return f"{h:02d}:{m:02d}"
+
+    # -----------------------------------------------------
+    # Main
+    # -----------------------------------------------------
+    def find(
+        self,
+        logs,
+        slot_minutes=60,
+        max_windows=4
+    ):
+
+        slot_count = len(logs)
+
+        # =====================================
+        # STEP 1
+        # Average
+        # =====================================
+
+        rates = [
+
+            np.mean(x)
+            if len(x)
+            else self.default_rate
+
+            for x in logs
+
+        ]
+
+        # =====================================
+        # STEP 2
+        # Percentile
+        # =====================================
+
+        threshold = np.percentile(
+            rates,
+            self.percentile
+        )
+
+        # =====================================
+        # STEP 3
+        # Binary
+        # =====================================
+
+        binary = "".join(
+
+            "1"
+            if r >= threshold
+            else "0"
+
+            for r in rates
+
+        )
+
+        # =====================================
+        # STEP 4
+        # Regex
+        # =====================================
+
+        windows = []
+
+        for match in re.finditer(r"1+", binary):
+
+            start = match.start()
+
+            end = match.end() - 1
+
+            score = float(
+                np.mean(
+                    rates[start:end+1]
+                )
+            )
+
+            length = end - start + 1
+
+            windows.append({
+
+                "start": start,
+
+                "end": end,
+
+                "length": length,
+
+                "score": score,
+
+                "start_time":
+                    self.slot_to_time(
+                        start,
+                        slot_minutes
+                    ),
+
+                "end_time":
+                    self.slot_to_time(
+                        end,
+                        slot_minutes
+                    ),
+
+                "binary":
+                    binary[start:end+1]
+
+            })
+
+        # =====================================
+        # STEP 5
+        # Sort
+        # =====================================
+
+        windows.sort(
+
+            key=lambda w: (
+
+                w["score"],
+
+                w["length"]
+
+            ),
+
+            reverse=True
+
+        )
+
+        windows = windows[:max_windows]
+
+        return {
+
+            "threshold": threshold,
+
+            "rates": rates,
+
+            "binary": binary,
+
+            "windows": windows
+
+        }
+
+
+# =====================================================
+# Example
+# =====================================================
+
+finder = GoldenWindowFinder(
+
+    percentile=65,
+
+    default_rate=0.5
+
+)
+
+# -----------------------------------------------------
+# Hour (24 Slots)
+# -----------------------------------------------------
+
+hour_result = finder.find(
+
+    logs=data["log"],
+
+    slot_minutes=60,
+
+    max_windows=4
+
+)
+
+data["golden_windows"] = hour_result["windows"]
+
+print("\n==============================")
+print(f"{sym} Hour Golden Windows")
+print("==============================")
+
+print(
+    "Binary :",
+    hour_result["binary"]
+)
+
+for i, w in enumerate(
+
+    hour_result["windows"],
+
+    1
+
+):
+
+    print(
+
+        f"#{i}"
+
+        f"  {w['start']:02d}"
+
+        f"~"
+
+        f"{w['end']:02d}"
+
+        f"   "
+
+        f"{w['start_time']}"
+
+        f"~"
+
+        f"{w['end_time']}"
+
+        f"   "
+
+        f"Score={w['score']:.4f}"
+
+        f"   "
+
+        f"Len={w['length']}"
+
+    )
+
+
+# -----------------------------------------------------
+# 10 Minutes (144 Slots)
+# -----------------------------------------------------
+
+ten_result = finder.find(
+
+    logs=data["log10"],
+
+    slot_minutes=10,
+
+    max_windows=24
+
+)
+
+data["golden_windows10"] = ten_result["windows"]
+
+print("\n==============================")
+print(f"{sym} 10-Min Golden Windows")
+print("==============================")
+
+print(
+    "Binary :",
+    ten_result["binary"]
+)
+
+for i, w in enumerate(
+
+    ten_result["windows"],
+
+    1
+
+):
+
+    print(
+
+        f"#{i:02d}"
+
+        f" "
+
+        f"{w['start']:03d}"
+
+        f"~"
+
+        f"{w['end']:03d}"
+
+        f" "
+
+        f"{w['start_time']}"
+
+        f"~"
+
+        f"{w['end_time']}"
+
+        f" "
+
+        f"Score={w['score']:.4f}"
+
+        f" "
+
+        f"Len={w['length']}"
+
+    )
