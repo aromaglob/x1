@@ -1,0 +1,480 @@
+###############################################################
+#
+# Adaptive Quant Golden Window Engine
+#
+# AQGW-DSL v6
+#
+###############################################################
+
+ENGINE
+
+VERSION
+
+    6.0
+
+
+###############################################################
+#
+# INPUT
+#
+###############################################################
+
+INPUT
+
+    SYMBOL
+
+    LOGS
+
+    SLOT_SIZE
+
+    MAX_WINDOWS
+
+    PERCENTILE
+
+    DEFAULT_RATE
+
+    MIN_TRADES
+
+    DECAY_ALPHA
+
+    REGIME
+
+
+###############################################################
+#
+# PREPROCESS
+#
+###############################################################
+
+FOR EACH SLOT
+
+    RATE
+
+        =
+
+        WEIGHTED_MEAN
+
+            LOGS
+
+            DECAY_ALPHA
+
+        OR
+
+        DEFAULT_RATE
+
+END
+
+
+###############################################################
+#
+# THRESHOLD
+#
+###############################################################
+
+THRESHOLD
+
+    =
+
+    PERCENTILE
+
+        RATE
+
+        PERCENTILE
+
+
+###############################################################
+#
+# BINARY
+#
+###############################################################
+
+BINARY
+
+    =
+
+    RATE
+
+    >=
+
+    THRESHOLD
+
+
+###############################################################
+#
+# REGEX
+#
+###############################################################
+
+WINDOW
+
+    =
+
+    REGEX
+
+        1+
+
+
+###############################################################
+#
+# WINDOW FEATURE
+#
+###############################################################
+
+FOR EACH WINDOW
+
+
+    LENGTH
+
+        =
+
+        COUNT
+
+
+    TRADE_COUNT
+
+        =
+
+        SUM
+
+            TRADE
+
+
+    WEIGHTED_MEAN
+
+        =
+
+        TIME_DECAY_MEAN
+
+
+    WEIGHTED_STD
+
+        =
+
+        TIME_DECAY_STD
+
+
+    STABILITY
+
+        =
+
+        1
+
+        /
+
+        (
+
+        1
+
+        +
+
+        WEIGHTED_STD
+
+        )
+
+
+    LENGTH_BONUS
+
+        =
+
+        LOG2
+
+        (
+
+        LENGTH
+
+        +
+
+        1
+
+        )
+
+
+    TRADE_BONUS
+
+        =
+
+        LOG2
+
+        (
+
+        TRADE_COUNT
+
+        +
+
+        2
+
+        )
+
+
+    CONFIDENCE
+
+        =
+
+        MIN
+
+        (
+
+        1,
+
+        TRADE_COUNT
+
+        /
+
+        MIN_TRADES
+
+        )
+
+
+    WIN_RATE
+
+        =
+
+        WINS
+
+        /
+
+        TRADES
+
+
+    WINRATE_BONUS
+
+        =
+
+        CLIP
+
+        (
+
+        0.5
+
+        +
+
+        WIN_RATE,
+
+        0.8,
+
+        1.5
+
+        )
+
+
+    PROFIT_FACTOR
+
+        =
+
+        GROSS_PROFIT
+
+        /
+
+        GROSS_LOSS
+
+
+    PF_BONUS
+
+        =
+
+        CLIP
+
+        (
+
+        LOG2
+
+        (
+
+        PF
+
+        +
+
+        1
+
+        ),
+
+        0.8,
+
+        2.5
+
+        )
+
+
+    CONSISTENCY
+
+        =
+
+        WINRATE_BONUS
+
+        *
+
+        PF_BONUS
+
+
+END
+
+
+###############################################################
+#
+# REGIME
+#
+###############################################################
+
+REGIME
+
+    ::
+
+        UP
+
+        DOWN
+
+        SIDEWAYS
+
+        HIGH_VOL
+
+        LOW_VOL
+
+
+REGIME_WEIGHT
+
+    =
+
+    MEMORY
+
+        SYMBOL
+
+        REGIME
+
+        WINDOW
+
+
+###############################################################
+#
+# QUANT SCORE
+#
+###############################################################
+
+QUALITY
+
+    =
+
+    WEIGHTED_MEAN
+
+    ^1.5
+
+    *
+
+    CONSISTENCY
+
+
+RELIABILITY
+
+    =
+
+    TRADE_BONUS
+
+    *
+
+    CONFIDENCE
+
+
+STATISTICAL
+
+    =
+
+    STABILITY
+
+    *
+
+    LENGTH_BONUS
+
+
+FINAL_SCORE
+
+    =
+
+    QUALITY
+
+    *
+
+    RELIABILITY
+
+    *
+
+    STATISTICAL
+
+    *
+
+    REGIME_WEIGHT
+
+
+###############################################################
+#
+# CLIP
+#
+###############################################################
+
+FINAL_SCORE
+
+    =
+
+    CLIP
+
+    (
+
+        FINAL_SCORE,
+
+        0,
+
+        100
+
+    )
+
+
+###############################################################
+#
+# SORT
+#
+###############################################################
+
+SORT
+
+    DESC
+
+        FINAL_SCORE
+
+    DESC
+
+        WEIGHTED_MEAN
+
+    DESC
+
+        CONSISTENCY
+
+    DESC
+
+        TRADE_COUNT
+
+    DESC
+
+        LENGTH
+
+
+###############################################################
+#
+# OUTPUT
+#
+###############################################################
+
+OUTPUT
+
+    TOP
+
+        MAX_WINDOWS
+
+
+STORE
+
+    SYMBOL
+
+        REGIME
+
+            WINDOWS
+
+
+END
