@@ -1,0 +1,147 @@
+import jwt, uuid, time, hashlib, requests
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Set
+from datetime import datetime
+from urllib.parse import urlencode, unquote
+from dataclasses import dataclass, asdict
+from threading import Thread
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+
+@dataclass(frozen=True)
+class TradingSlotSignal:
+    slot_index: int; macro_hour: int; score: float; start_time: str; end_time: str 
+
+@dataclass(frozen=True)
+class MinuteSlotSignal:
+    minute_index: int; parent_slot_index: int; score: float; start_time: str; end_time: str
+
+class MultiTimeframeRepository(ABC):
+    @abstractmethod
+    def get_hour_logs(self, symbol: str) -> List[List[int]]: pass 
+    @abstractmethod
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]: pass
+    @abstractmethod
+    def get_one_minute_logs(self, symbol: str) -> List[List[int]]: pass
+
+class UpbitDunamuClient:
+    def __init__(self, access_key: str, secret_key: str) -> None:
+        self.access_key, self.secret_key, self.base_url = access_key, secret_key, "https://upbit.com"
+
+    def _generate_jwt_token(self, query_params: dict = None) -> str:
+        payload = {"access_key": self.access_key, "nonce": str(uuid.uuid4())}
+        if query_params:
+            qs = unquote(urlencode(query_params)).encode("utf-8")
+            m = hashlib.sha512()
+            m.update(qs)
+            payload.update({"query_hash": m.hexdigest(), "query_hash_alg": "SHA512"})
+        return f"Bearer {jwt.encode(payload, self.secret_key, algorithm='HS256')}"
+
+    def execute_market_order(self, market: str, side: str, price: str = None, volume: str = None) -> dict:
+        url = f"{self.base_url}/v1/orders"
+        params = {"market": market, "side": side}
+        if side == "bid" and price: params.update({"price": price, "ord_type": "price"})
+        elif side == "ask" and volume: params.update({"volume": volume, "ord_type": "market"})
+        else: raise ValueError("INVALID_ORDER_SPEC")
+        time.sleep(0.15)
+        res = requests.post(url, json=params, headers={"Authorization": self._generate_jwt_token(params)})
+        if res.status_code not in (200, 201): raise RuntimeError(f"UPBIT_API_ERR: {res.text}")
+        return res.json()
+
+class AdvancedSlotSelector:
+    def __init__(self, repository: MultiTimeframeRepository) -> None:
+        if not repository: raise ValueError("CRITICAL_ERR")
+        self.repository = repository 
+
+    def select_elite_trading_slots(self, symbol: str, hour_percentile: float = 50.0, max_final_slots: int = 24) -> List[TradingSlotSignal]:
+        h_logs, t_logs = self.repository.get_hour_logs(symbol), self.repository.get_ten_minute_logs(symbol)
+        if len(h_logs) != 24 or len(t_logs) != 144: raise ValueError("DATA_INTEGRITY_ERR") 
+        h_rates = [float(np.mean(h)) if h and all(v in (0, 1) for v in h) else 0.5 for h in h_logs]
+        q_hours = {i for i, r in enumerate(h_rates) if r >= float(np.percentile(h_rates, hour_percentile))} 
+        candidates = [] 
+        for i, t in enumerate(t_logs):
+            hour = i // 6 
+            if hour in q_hours:
+                score = float(np.mean(t)) if t and all(v in (0, 1) for v in t) else 0.5
+                sm, em = i * 10, (i + 1) * 10
+                candidates.append(TradingSlotSignal(i, hour, score, f"{(sm//60)%24:02d}:{sm%60:02d}", f"{(em//60)%24:02d}:{em%60:02d}")) 
+        candidates.sort(key=lambda s: (s.score, -s.slot_index), reverse=True)
+        res = candidates[:max_final_slots]
+        res.sort(key=lambda s: s.slot_index)
+        return res
+
+    def reverify_slots_by_minute(self, symbol: str, target_slots: List[TradingSlotSignal]) -> List[MinuteSlotSignal]:
+        m_logs = self.repository.get_one_minute_logs(symbol)
+        if len(m_logs) != 1440: raise ValueError("DATA_INTEGRITY_ERR") 
+        candidates = []
+        for slot in target_slots:
+            base = slot.slot_index * 10
+            for offset in range(10):
+                idx = base + offset
+                score = float(np.mean(m_logs[idx])) if m_logs[idx] and all(v in (0, 1) for v in m_logs[idx]) else 0.5
+                candidates.append(MinuteSlotSignal(idx, slot.slot_index, score, f"{(idx//60)%24:02d}:{idx%60:02d}", f"{((idx+1)//60)%24:02d}:{ (idx+1)%60:02d}"))
+        candidates.sort(key=lambda m: (m.score, -m.minute_index), reverse=True)
+        return candidates
+
+class ProductionMarketDatabase(MultiTimeframeRepository):
+    def get_hour_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(42); return [np.random.choice([0, 1], size=20, p=[0.48, 0.52]).tolist() for _ in range(24)] 
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(999); return [np.random.choice([0, 1], size=8, p=[0.46, 0.54]).tolist() for _ in range(144)]
+    def get_one_minute_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(555); data = [np.random.choice([0, 1], size=3, p=[0.47, 0.53]).tolist() for _ in range(1440)]
+        data[(datetime.now().hour * 60) + datetime.now().minute] =; return data
+
+app = FastAPI(title="Upbit Mini Engine", version="4.0.0")
+ENGINE_STATE = {"symbol": "KRW-BTC", "hour_percentile": 50.0, "max_final_slots": 24, "cached_ten": [], "cached_min": [], "cached_set": set(), "last_triggered": -1, "is_running": True, "logs": []}
+
+def background_monitoring_loop(client: UpbitDunamuClient):
+    while ENGINE_STATE["is_running"]:
+        try:
+            now = datetime.now()
+            cur_idx = (now.hour * 60) + now.minute
+            if cur_idx in ENGINE_STATE["cached_set"] and cur_idx != ENGINE_STATE["last_triggered"]:
+                log = f"[MATCH] {now.strftime('%Y-%m-%d %H:%M:%S')} | Minute: {cur_idx}"
+                print(f"\n🎯 {log}"); ENGINE_STATE["logs"].append(log)
+                try:
+                    receipt = client.execute_market_order(market=ENGINE_STATE["symbol"], side="bid", price="5000")
+                    msg = f"[SUCCESS] UUID: {receipt.get('uuid')}"
+                except Exception as e: msg = f"[FAILED] Reason: {str(e)}"
+                print(msg); ENGINE_STATE["logs"].append(msg)
+                ENGINE_STATE["last_triggered"] = cur_idx
+            if len(ENGINE_STATE["logs"]) > 100: ENGINE_STATE["logs"] = ENGINE_STATE["logs"][-100:]
+            time.sleep(1)
+        except Exception as e: time.sleep(5)
+
+def _recalibrate():
+    db = ProductionMarketDatabase(); selector = AdvancedSlotSelector(db)
+    t_slots = selector.select_elite_trading_slots(ENGINE_STATE["symbol"], ENGINE_STATE["hour_percentile"], ENGINE_STATE["max_final_slots"])
+    m_slots = selector.reverify_slots_by_minute(ENGINE_STATE["symbol"], t_slots)
+    ENGINE_STATE.update({"cached_ten": t_slots, "cached_min": m_slots, "cached_set": {m.minute_index for m in m_slots[:24]}})
+
+@app.on_event("startup")
+def boot_system():
+    client = UpbitDunamuClient("MOCK_ACCESS", "MOCK_SECRET"); _recalibrate()
+    Thread(target=background_monitoring_loop, args=(client,), daemon=True).start()
+
+@app.on_event("shutdown")
+def shutdown_system(): ENGINE_STATE["is_running"] = False
+
+@app.get("/api/v4/engine/status")
+def get_status():
+    return {"symbol": ENGINE_STATE["symbol"], "active": ENGINE_STATE["is_running"], "last_idx": ENGINE_STATE["last_triggered"], "cur_idx": (datetime.now().hour * 60) + datetime.now().minute, "targets_count": len(ENGINE_STATE["cached_set"])}
+
+@app.get("/api/v4/engine/slots/ten")
+def get_ten(): return [asdict(s) for s in ENGINE_STATE["cached_ten"]]
+
+@app.get("/api/v4/engine/slots/minute")
+def get_min(): return [asdict(m) for m in ENGINE_STATE["cached_min"]]
+
+@app.get("/api/v4/engine/logs")
+def get_logs(): return {"history": ENGINE_STATE["logs"][::-1]}
+
+@app.post("/api/v4/engine/recalibrate")
+def recalibrate(p: float = Query(50.0), m: int = Query(24)):
+    ENGINE_STATE.update({"hour_percentile": p, "max_final_slots": m}); _recalibrate()
+    return {"status": "SUCCESS"}
