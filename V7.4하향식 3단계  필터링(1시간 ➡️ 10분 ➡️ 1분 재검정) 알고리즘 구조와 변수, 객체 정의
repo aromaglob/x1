@@ -1,0 +1,180 @@
+import os
+import jwt
+import uuid
+import hashlib
+import requests
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Set
+from dataclasses import dataclass
+from urllib.parse import urlencode
+
+@dataclass(frozen=True)
+class TradingSlotSignal:
+    slot_index: int
+    macro_hour: int
+    score: float
+    start_time: str
+    end_time: str 
+
+@dataclass(frozen=True)
+class MinuteSlotSignal:
+    minute_index: int
+    parent_slot_index: int
+    score: float
+    start_time: str
+    end_time: str
+
+class MultiTimeframeRepository(ABC):
+    @abstractmethod
+    def get_hour_logs(self, symbol: str) -> List[List[int]]: pass 
+    @abstractmethod
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]: pass
+    @abstractmethod
+    def get_one_minute_logs(self, symbol: str) -> List[List[int]]: pass
+
+class UpbitMarketRepository(MultiTimeframeRepository):
+    def __init__(self, access_key: str, secret_key: str):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.base_url = "https://upbit.com"
+
+    def _generate_headers(self, query_params: dict = None) -> dict:
+        payload = {
+            "access_key": self.access_key,
+            "nonce": str(uuid.uuid4())
+        }
+        if query_params:
+            query_string = urlencode(query_params).encode("utf-8")
+            m = hashlib.sha512()
+            m.update(query_string)
+            query_hash = m.hexdigest()
+            payload["query_hash"] = query_hash
+            payload["query_hash_alg"] = "SHA512"
+        
+        jwt_token = jwt.encode(payload, self.secret_key, algorithm="HS256")
+        return {"Authorization": f"Bearer {jwt_token}"}
+
+    def _fetch_candles(self, unit: str, count: int, symbol: str) -> List[dict]:
+        url = f"{self.base_url}/v1/candles/minutes/{unit}"
+        params = {"market": symbol, "count": count}
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            raise RuntimeError(f"UPBIT_API_ERR: HTTP {response.status_code} - {response.text}")
+        return response.json()
+
+    def _parse_candles_to_binary_logs(self, candles: List[dict], expected_len: int, step: int) -> List[List[int]]:
+        flat_binaries = [1 if float(c["trade_price"]) >= float(c["opening_price"]) else 0 for c in reversed(candles)]
+        if len(flat_binaries) < expected_len:
+            flat_binaries = [0] * (expected_len - len(flat_binaries)) + flat_binaries
+        else:
+            flat_binaries = flat_binaries[-expected_len:]
+        
+        return [[flat_binaries[i]] for i in range(expected_len)]
+
+    def get_hour_logs(self, symbol: str) -> List[List[int]]:
+        candles = self._fetch_candles(unit="60", count=24, symbol=symbol)
+        return self._parse_candles_to_binary_logs(candles, 24, 1)
+
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]:
+        candles = self._fetch_candles(unit="10", count=144, symbol=symbol)
+        return self._parse_candles_to_binary_logs(candles, 144, 1)
+
+    def get_one_minute_logs(self, symbol: str) -> List[List[int]]:
+        candles = self._fetch_candles(unit="1", count=1440, symbol=symbol)
+        return self._parse_candles_to_binary_logs(candles, 1440, 1)
+
+    def execute_order(self, symbol: str, side: str, volume: str = None, price: str = None, ord_type: str = "market") -> dict:
+        url = f"{self.base_url}/v1/orders"
+        params = {
+            "market": symbol,
+            "side": side,
+            "ord_type": ord_type
+        }
+        if volume: params["volume"] = volume
+        if price: params["price"] = price
+        
+        headers = self._generate_headers(query_params=params)
+        response = requests.post(url, json=params, headers=headers)
+        if response.status_code not in (200, 201):
+            raise RuntimeError(f"UPBIT_ORDER_FAILED: {response.text}")
+        return response.json()
+
+class AdvancedSlotSelector:
+    def __init__(self, repository: MultiTimeframeRepository) -> None:
+        if not repository: raise ValueError("CRITICAL_ERR: Repository interface cannot be null.")
+        self.repository = repository 
+
+    def select_elite_trading_slots(self, symbol: str, hour_percentile: float = 50.0, max_final_slots: int = 24) -> List[TradingSlotSignal]:
+        if not symbol or not (0.0 <= hour_percentile <= 100.0) or max_final_slots <= 0: raise ValueError("INVALID_PARAMETER") 
+        hour_logs, ten_min_logs = self.repository.get_hour_logs(symbol), self.repository.get_ten_minute_logs(symbol)
+        if len(hour_logs) != 24 or len(ten_min_logs) != 144: raise ValueError("DATA_INTEGRITY_ERR") 
+
+        hour_rates = [float(np.mean(h)) if h and all(v in (0, 1) for v in h) else 0.5 for h in hour_logs]
+        hour_threshold = float(np.percentile(hour_rates, hour_percentile))
+        qualified_hours = {i for i, r in enumerate(hour_rates) if r >= hour_threshold} 
+
+        all_candidate_slots = [] 
+        for i, t_log in enumerate(ten_min_logs):
+            belonging_hour = i // 6 
+            if belonging_hour in qualified_hours:
+                score = float(np.mean(t_log)) if t_log and all(v in (0, 1) for v in t_log) else 0.5
+                s_min, e_min = i * 10, (i + 1) * 10
+                all_candidate_slots.append(TradingSlotSignal(
+                    slot_index=i, macro_hour=belonging_hour, score=score,
+                    start_time=f"{(s_min // 60) % 24:02d}:{s_min % 60:02d}", end_time=f"{(e_min // 60) % 24:02d}:{e_min % 60:02d}"
+                )) 
+
+        all_candidate_slots.sort(key=lambda s: (s.score, -s.slot_index), reverse=True)
+        final_slots = all_candidate_slots[:max_final_slots]
+        final_slots.sort(key=lambda s: s.slot_index)
+        return final_slots
+
+    def reverify_slots_by_minute(self, symbol: str, target_slots: List[TradingSlotSignal]) -> List[MinuteSlotSignal]:
+        if not symbol or not target_slots: raise ValueError("INVALID_PARAMETER")
+        one_min_logs = self.repository.get_one_minute_logs(symbol)
+        if len(one_min_logs) != 1440: raise ValueError("DATA_INTEGRITY_ERR") 
+
+        all_minute_candidates = []
+        for slot in target_slots:
+            base_minute = slot.slot_index * 10
+            for m_offset in range(10):
+                t_idx = base_minute + m_offset
+                m_log = one_min_logs[t_idx]
+                score = float(np.mean(m_log)) if m_log and all(v in (0, 1) for v in m_log) else 0.5
+                all_minute_candidates.append(MinuteSlotSignal(
+                    minute_index=t_idx, parent_slot_index=slot.slot_index, score=score,
+                    start_time=f"{(t_idx // 60) % 24:02d}:{t_idx % 60:02d}", end_time=f"{((t_idx + 1) // 60) % 24:02d}:{(t_idx + 1) % 60:02d}"
+                ))
+        all_minute_candidates.sort(key=lambda m: (m.score, -m.minute_index), reverse=True)
+        return all_minute_candidates
+
+if __name__ == "__main__":
+    UPBIT_ACCESS = os.environ.get("UPBIT_OPEN_API_ACCESS_KEY", "YOUR_ACCESS_KEY")
+    UPBIT_SECRET = os.environ.get("UPBIT_OPEN_API_SECRET_KEY", "YOUR_SECRET_KEY")
+    target_market = "KRW-BTC"
+    
+    try:
+        upbit_pipeline = UpbitMarketRepository(access_key=UPBIT_ACCESS, secret_key=UPBIT_SECRET)
+        engine = AdvancedSlotSelector(repository=upbit_pipeline)
+        
+        target_slots = engine.select_elite_trading_slots(symbol=target_market, hour_percentile=50.0, max_final_slots=24)
+        reverified_mins = engine.reverify_slots_by_minute(symbol=target_market, target_slots=target_slots)
+        
+        print(f"🧬 [{target_market}] Upbit Pipeline Active: Multi-Stage Filter Sequence Matrix Completed.")
+        
+        current_time_minutes = (datetime.now().hour * 60) + datetime.now().minute
+        top_minute_targets = {m.minute_index: m for m in reverified_mins[:24]}
+        
+        if current_time_minutes in top_minute_targets:
+            target_signal = top_minute_targets[current_time_minutes]
+            order_receipt = upbit_pipeline.execute_order(
+                symbol=target_market,
+                side="bid",
+                price="5000",
+                ord_type="price"
+            )
+            print(f"🚀 [LIVE ORDER PLACED] Receipt ID: {order_receipt.get('uuid')}")
+            
+    except Exception as exc:
+        print(f"🚨 SYSTEM_HALT: {str(exc)}")
