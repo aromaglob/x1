@@ -1,0 +1,154 @@
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Set
+from dataclasses import dataclass 
+
+@dataclass(frozen=True)
+class TradingSlotSignal:
+    slot_index: int
+    macro_hour: int
+    score: float
+    start_time: str
+    end_time: str 
+
+class MultiTimeframeRepository(ABC):
+    @abstractmethod
+    def get_hour_logs(self, symbol: str) -> List[List[int]]:
+        pass 
+
+    @abstractmethod
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]:
+        pass
+
+class AdvancedSlotSelector:
+    def __init__(self, repository: MultiTimeframeRepository) -> None:
+        if repository is None:
+            raise ValueError("CRITICAL_ERR: Repository interface binding cannot be null.")
+        self.repository = repository 
+
+    def select_elite_trading_slots(
+        self,
+        symbol: str,
+        hour_percentile: float = 50.0,
+        max_final_slots: int = 24
+    ) -> List[TradingSlotSignal]:
+
+        if not symbol or not isinstance(symbol, str):
+            raise ValueError("INVALID_PARAMETER: Symbol string is null or empty.")
+        if not (0.0 <= hour_percentile <= 100.0):
+            raise ValueError("INVALID_PARAMETER: Hour percentile must be between 0.0 and 100.0.")
+        if max_final_slots <= 0:
+            raise ValueError("INVALID_PARAMETER: Maximum final slots must be greater than zero.") 
+
+        try:
+            hour_logs: List[List[int]] = self.repository.get_hour_logs(symbol)
+            ten_min_logs: List[List[int]] = self.repository.get_ten_minute_logs(symbol)
+        except Exception as exc:
+            raise RuntimeError(f"HARDWARE_IO_ERR: Failed to pull dataset via interface pipeline: {str(exc)}") from exc 
+
+        if len(hour_logs) != 24:
+            raise ValueError(f"DATA_INTEGRITY_ERR: Expected exactly 24 hourly logs, got {len(hour_logs)}.")
+        if len(ten_min_logs) != 144:
+            raise ValueError(f"DATA_INTEGRITY_ERR: Expected exactly 144 ten-minute logs, got {len(ten_min_logs)}.") 
+
+        hour_rates: List[float] = []
+        for idx, h_log in enumerate(hour_logs):
+            if not isinstance(h_log, list):
+                raise TypeError(f"TYPE_VIOLATION: Element at hour index {idx} is not a valid list structures.") 
+
+            log_len: int = len(h_log)
+            if log_len > 0: 
+                if not all(isinstance(val, int) and (val == 0 or val == 1) for val in h_log):
+                    raise ValueError(f"DATA_VIOLATION: Non-binary payload detected at hour index {idx}.")
+                hour_rates.append(float(np.mean(h_log)))
+            else:
+                hour_rates.append(0.5) 
+
+        try:
+            hour_threshold: float = float(np.percentile(hour_rates, hour_percentile))
+        except Exception as exc:
+            hour_threshold = 0.5 
+
+        qualified_hours: Set[int] = {
+            h_idx for h_idx, rate in enumerate(hour_rates) if rate >= hour_threshold
+        } 
+
+        all_candidate_slots: List[TradingSlotSignal] = [] 
+
+        for i in range(144):
+            belonging_hour: int = i // 6 
+
+            if belonging_hour in qualified_hours:
+                t_log: List[int] = ten_min_logs[i]
+                if not isinstance(t_log, list):
+                    raise TypeError(f"TYPE_VIOLATION: Element at slot index {i} is not a valid list structures.")
+                t_len: int = len(t_log)
+                if t_len > 0:
+                    if not all(isinstance(val, int) and (val == 0 or val == 1) for val in t_log):
+                        raise ValueError(f"DATA_VIOLATION: Non-binary payload detected at slot index {i}.")
+                    score: float = float(np.mean(t_log))
+                else:
+                    score = 0.5
+
+                total_start_mins: int = i * 10
+                total_end_mins: int = (i + 1) * 10
+
+                start_time: str = f"{(total_start_mins // 60) % 24:02d}:{total_start_mins % 60:02d}"
+                end_time: str = f"{(total_end_mins // 60) % 24:02d}:{total_end_mins % 60:02d}"
+
+                all_candidate_slots.append(
+                    TradingSlotSignal(
+                        slot_index=i,
+                        macro_hour=belonging_hour,
+                        score=score,
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                ) 
+
+        all_candidate_slots.sort(key=lambda s: (s.score, -s.slot_index), reverse=True)
+
+        final_selected_slots: List[TradingSlotSignal] = all_candidate_slots[:max_final_slots]
+        final_selected_slots.sort(key=lambda s: s.slot_index)
+
+        return final_selected_slots
+
+class SimulatedMarketRepository(MultiTimeframeRepository):
+    def get_hour_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(42)
+        return [np.random.choice([0, 1], size=np.random.randint(10, 30), p=[0.48, 0.52]).tolist() for _ in range(24)] 
+
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(999)
+        mock_data = [np.random.choice([0, 1], size=np.random.randint(3, 10), p=[0.46, 0.54]).tolist() for _ in range(144)]
+        mock_data[6] = [1, 1, 1, 1, 1]
+        mock_data[143] = [1, 1, 1, 1, 1]
+        return mock_data
+
+if __name__ == "__main__":
+    sym: str = "BTCUSDT" 
+
+    try:
+        market_db: MultiTimeframeRepository = SimulatedMarketRepository()
+        engine = AdvancedSlotSelector(repository=market_db)
+        target_trading_slots: List[TradingSlotSignal] = engine.select_elite_trading_slots(
+            symbol=sym,
+            hour_percentile=50.0,
+            max_final_slots=24
+        )
+
+        print(f"🧬 [{sym}] Mission-Critical Multi-Stage Validated Target Slots Matrix")
+        print(f"{'No':^4} | {'Slot ID':^7} | {'Parent Hour':^11} | {'Time Window':^15} | {'Score':^8}")
+        print("-" * 60)
+
+        for idx, s in enumerate(target_trading_slots, start=1):
+            print(
+                f"{idx:02d}   |  "
+                f"{s.slot_index:03d}   |  "
+                f"Hour {s.macro_hour:02d}   |  "
+                f"{s.start_time}~{s.end_time}  |  "
+                f"{s.score:.3f} "
+            )
+
+    except Exception as fatal_exception:
+        print(f"🚨 SYSTEM_HALT: Critical internal error bypassed framework protection: {str(fatal_exception)}")
