@@ -1,0 +1,107 @@
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Set
+from dataclasses import dataclass 
+
+@dataclass(frozen=True)
+class TradingSlotSignal:
+    slot_index: int
+    macro_hour: int
+    score: float
+    start_time: str
+    end_time: str 
+
+@dataclass(frozen=True)
+class MinuteSlotSignal:
+    minute_index: int
+    parent_slot_index: int
+    score: float
+    start_time: str
+    end_time: str
+
+class MultiTimeframeRepository(ABC):
+    @abstractmethod
+    def get_hour_logs(self, symbol: str) -> List[List[int]]: pass 
+    @abstractmethod
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]: pass
+    @abstractmethod
+    def get_one_minute_logs(self, symbol: str) -> List[List[int]]: pass
+
+class AdvancedSlotSelector:
+    def __init__(self, repository: MultiTimeframeRepository) -> None:
+        if not repository: raise ValueError("CRITICAL_ERR: Repository interface cannot be null.")
+        self.repository = repository 
+
+    def select_elite_trading_slots(self, symbol: str, hour_percentile: float = 50.0, max_final_slots: int = 24) -> List[TradingSlotSignal]:
+        if not symbol or not (0.0 <= hour_percentile <= 100.0) or max_final_slots <= 0: raise ValueError("INVALID_PARAMETER") 
+        hour_logs, ten_min_logs = self.repository.get_hour_logs(symbol), self.repository.get_ten_minute_logs(symbol)
+        if len(hour_logs) != 24 or len(ten_min_logs) != 144: raise ValueError("DATA_INTEGRITY_ERR") 
+
+        hour_rates = [float(np.mean(h)) if h and all(v in (0, 1) for v in h) else 0.5 for h in hour_logs]
+        hour_threshold = float(np.percentile(hour_rates, hour_percentile))
+        qualified_hours = {i for i, r in enumerate(hour_rates) if r >= hour_threshold} 
+
+        all_candidate_slots = [] 
+        for i, t_log in enumerate(ten_min_logs):
+            belonging_hour = i // 6 
+            if belonging_hour in qualified_hours:
+                score = float(np.mean(t_log)) if t_log and all(v in (0, 1) for v in t_log) else 0.5
+                s_min, e_min = i * 10, (i + 1) * 10
+                all_candidate_slots.append(TradingSlotSignal(
+                    slot_index=i, macro_hour=belonging_hour, score=score,
+                    start_time=f"{(s_min // 60) % 24:02d}:{s_min % 60:02d}", end_time=f"{(e_min // 60) % 24:02d}:{e_min % 60:02d}"
+                )) 
+
+        all_candidate_slots.sort(key=lambda s: (s.score, -s.slot_index), reverse=True)
+        final_slots = all_candidate_slots[:max_final_slots]
+        final_slots.sort(key=lambda s: s.slot_index)
+        return final_slots
+
+    def reverify_slots_by_minute(self, symbol: str, target_slots: List[TradingSlotSignal]) -> List[MinuteSlotSignal]:
+        if not symbol or not target_slots: raise ValueError("INVALID_PARAMETER")
+        one_min_logs = self.repository.get_one_minute_logs(symbol)
+        if len(one_min_logs) != 1440: raise ValueError("DATA_INTEGRITY_ERR") 
+
+        all_minute_candidates = []
+        for slot in target_slots:
+            base_minute = slot.slot_index * 10
+            for m_offset in range(10):
+                t_idx = base_minute + m_offset
+                m_log = one_min_logs[t_idx]
+                score = float(np.mean(m_log)) if m_log and all(v in (0, 1) for v in m_log) else 0.5
+                all_minute_candidates.append(MinuteSlotSignal(
+                    minute_index=t_idx, parent_slot_index=slot.slot_index, score=score,
+                    start_time=f"{(t_idx // 60) % 24:02d}:{t_idx % 60:02d}", end_time=f"{((t_idx + 1) // 60) % 24:02d}:{(t_idx + 1) % 60:02d}"
+                ))
+        all_minute_candidates.sort(key=lambda m: (m.score, -m.minute_index), reverse=True)
+        return all_minute_candidates
+
+class SimulatedMarketRepository(MultiTimeframeRepository):
+    def get_hour_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(42)
+        return [np.random.choice([0, 1], size=np.random.randint(10, 30), p=[0.48, 0.52]).tolist() for _ in range(24)] 
+    def get_ten_minute_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(999)
+        mock = [np.random.choice([0, 1], size=np.random.randint(3, 10), p=[0.46, 0.54]).tolist() for _ in range(144)]
+        mock[6], mock[143] = [1]*5, [1]*5
+        return mock
+    def get_one_minute_logs(self, symbol: str) -> List[List[int]]:
+        np.random.seed(555)
+        mock_min = [np.random.choice([0, 1], size=np.random.randint(2, 5), p=[0.47, 0.53]).tolist() for _ in range(1440)]
+        mock_min[60], mock_min[1439] = [1]*5, [1]*5
+        return mock_min
+
+if __name__ == "__main__":
+    sym = "BTCUSDT" 
+    try:
+        market_db = SimulatedMarketRepository()
+        engine = AdvancedSlotSelector(repository=market_db)
+        target_slots = engine.select_elite_trading_slots(symbol=sym, hour_percentile=50.0, max_final_slots=24)
+        reverified_mins = engine.reverify_slots_by_minute(symbol=sym, target_slots=target_slots)
+
+        print(f"🧬 [{sym}] 24 Elite Ten-Minute Slots Sample")
+        for s in target_slots[:3]: print(f"Slot {s.slot_index:03d} | Hour {s.macro_hour:02d} | {s.start_time}~{s.end_time} | {s.score:.3f}")
+        print(f"\n⚡ [{sym}] Re-verified 240 Minute Slots Sample (Top 5)")
+        for m in reverified_mins[:5]: print(f"Rank | Min {m.minute_index:04d} | Slot {m.parent_slot_index:03d} | {m.start_time}~{m.end_time} | {m.score:.3f}")
+    except Exception as exc:
+        print(f"🚨 SYSTEM_HALT: {str(exc)}")
